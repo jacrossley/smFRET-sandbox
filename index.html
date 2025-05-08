@@ -1,0 +1,362 @@
+<!--
+  smFRET-diffusion-sandbox
+  An interactive simulation of dynamics in diffusion-based smFRET for teaching and demo purposes.
+  Author: Joel A. Crossley, 2025
+  Affiliation: Astbury Centre for Structural Molecular Biology,
+               School of Molecular and Cellular Biology,
+               Faculty of Biological Sciences, University of Leeds, Leeds LS2 9JT
+-->
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>smFRET Sandbox</title>
+  <style>
+    html, body { margin: 0; height: 100%; overflow: hidden; }
+    #proteinCanvas { position: fixed; inset: 0; width: 100%; height: 100%; z-index: -2; pointer-events: none; }
+    #plotCanvas    { position: fixed; left: 0; bottom: 0; width: 100%; z-index: -1; pointer-events: none; }
+  </style>
+</head>
+<body>
+  <canvas id="proteinCanvas"></canvas>
+  <canvas id="plotCanvas"></canvas>
+
+  <!-- Controls ------------------------------------------------------------ -->
+  <div style="position: fixed; top: 10px; left: 10px; background: rgba(255,255,255,0.8); padding: 10px; border-radius: 8px; z-index: 10; font-family: sans-serif;">
+    <label>
+      Particles:
+      <input type="number" id="numParticlesInput" min="1" step="1" style="width: 3em;">
+    </label><br>
+    <label>
+      Circle ➔ Square rate (s<sup>−1</sup>):
+      <input type="number" id="rateC2SInput" min="0.1" step="0.1" style="width: 3em;">
+    </label><br>
+    <label>
+      Square ➔ Circle rate (s<sup>−1</sup>):
+      <input type="number" id="rateS2CInput" min="0.1" step="0.1" style="width: 3em;">
+    </label><br>
+    <!-- NEW: mouse-controlled particle toggle -->
+    <label>
+      <input type="checkbox" id="mouseParticleCheckbox">
+      Mouse is particle
+    </label><br>
+    <button id="applySettings">Apply</button>
+  </div>
+
+  <!-- Author and affiliation overlay -->
+  <div style="position: fixed; top: 10px; right: 10px; background: rgba(255,255,255,0.7); padding: 4px 8px; border-radius: 4px; font-size: 1.0em; font-family: sans-serif; z-index: 10; text-align: right;">
+    An interactive simulation of dynamics in diffusion-based smFRET for teaching and demo purposes.<br>
+    Joel A. Crossley<br>
+    University of Leeds, 2025<br>
+  </div>
+
+  <script>
+    /* --------------------------------------------------------------------
+       CONSTANTS & GLOBALS
+    -------------------------------------------------------------------- */
+    const TRAIL_ALPHA        = 0.3;
+    const PLOT_RATIO         = 1.0;
+    const WAIST_X            = 100 * (window.devicePixelRatio || 1);
+    const WAIST_Y            = 50  * (window.devicePixelRatio || 1);
+    const FLAT_TOP           = 0.8;
+
+    let NUM_PARTICLES        = 20;
+    let RATE_CIRCLE2SQR      = 8;
+    let RATE_SQR2CIRCLE      = 4;
+
+    /* ----------------------- Utility random helpers -------------------- */
+    function samplePoisson(lambda) {
+      if (lambda < 30) {
+        let L = Math.exp(-lambda), k = 0, p = 1;
+        while (p > L) { k++; p *= Math.random(); }
+        return k - 1;
+      }
+      const std = Math.sqrt(lambda);
+      const z = Math.sqrt(-2 * Math.log(Math.random())) * Math.cos(2 * Math.PI * Math.random());
+      return Math.max(0, Math.round(lambda + std * z));
+    }
+    const expRand = λ => -Math.log(1 - Math.random()) / λ;
+
+    /* ----------------------------- Canvas ------------------------------ */
+    const dpr        = window.devicePixelRatio || 1;
+    const simCanvas  = document.getElementById('proteinCanvas');
+    const simCtx     = simCanvas.getContext('2d');
+    const plotCanvas = document.getElementById('plotCanvas');
+    const plotCtx    = plotCanvas.getContext('2d');
+    let plotHeightPx = 0;
+
+    function resize() {
+      simCanvas.width  = window.innerWidth  * dpr;
+      simCanvas.height = window.innerHeight * dpr;
+      simCanvas.style.width  = window.innerWidth  + 'px';
+      simCanvas.style.height = window.innerHeight + 'px';
+
+      const plotCssH = window.innerHeight * PLOT_RATIO;
+      plotCanvas.width  = window.innerWidth * dpr;
+      plotCanvas.height = plotCssH * dpr;
+      plotCanvas.style.width  = window.innerWidth + 'px';
+      plotCanvas.style.height = plotCssH + 'px';
+      plotHeightPx = plotCanvas.height;
+    }
+    resize();
+    window.addEventListener('resize', resize);
+
+    /* -------------------------- DOM references ------------------------- */
+    const numParticlesInput   = document.getElementById('numParticlesInput');
+    const rateC2SInput        = document.getElementById('rateC2SInput');
+    const rateS2CInput        = document.getElementById('rateS2CInput');
+    const mouseCheckbox       = document.getElementById('mouseParticleCheckbox');
+    const applyBtn            = document.getElementById('applySettings');
+
+    /* -------------------------- Initial values ------------------------- */
+    numParticlesInput.value = NUM_PARTICLES;
+    rateC2SInput.value      = RATE_CIRCLE2SQR;
+    rateS2CInput.value      = RATE_SQR2CIRCLE;
+
+    /* ----------------------- Particle containers ----------------------- */
+    let particles = [];
+
+    function createParticles() {
+      particles = Array.from({ length: NUM_PARTICLES }, () => ({
+        x: Math.random() * simCanvas.width,
+        y: Math.random() * simCanvas.height,
+        vx: 0, vy: 0,
+        r: 10 * dpr,
+        shape: 'circle',
+        tSwitch: expRand(RATE_CIRCLE2SQR)
+      }));
+    }
+    createParticles();
+
+    /* --------------------- Mouse-controlled particle ------------------- */
+    let mouseAsParticle = false;
+    let mouseParticle   = null;  // will be created lazily
+    const mousePos      = { x: simCanvas.width / 2, y: simCanvas.height / 2 };
+
+    // track mouse position (CSS pixels → device pixels)
+    window.addEventListener('mousemove', e => {
+      mousePos.x = e.clientX * dpr;
+      mousePos.y = e.clientY * dpr;
+    });
+
+    function createMouseParticle() {
+      mouseParticle = {
+        x: mousePos.x,
+        y: mousePos.y,
+        vx: 0, vy: 0,           // not used but keeps structure consistent
+        r: 10 * dpr,
+        shape: 'circle',
+        tSwitch: expRand(RATE_CIRCLE2SQR),
+        isMouse: true          // handy flag (not strictly required)
+      };
+    }
+
+    mouseCheckbox.addEventListener('change', () => {
+      mouseAsParticle = mouseCheckbox.checked;
+      if (mouseAsParticle) {
+        createMouseParticle();
+      } else {
+        mouseParticle = null;
+      }
+      // update max channel rate
+      MAX_RATE_CH = Math.max(CIRCLE_R, SQUARE_G) * (NUM_PARTICLES + (mouseAsParticle ? 1 : 0));
+    });
+
+    /* -------------------------- Photon model --------------------------- */
+    const BASELINE = 1000;
+    const CIRCLE_G = 10000;
+    const CIRCLE_R = 30000;
+    const SQUARE_G = 30000;
+    const SQUARE_R = 10000;
+
+    const HISTORY_MS  = 5000;
+    const greenSeries = [];
+    const redSeries   = [];
+    let MAX_RATE_CH   = Math.max(CIRCLE_R, SQUARE_G) * NUM_PARTICLES;
+
+    /* -------------------- Confocal weighting --------------------------- */
+    function confocalWeight(px, py) {
+      const cx = simCanvas.width / 2;
+      const cy = simCanvas.height / 2;
+      const dx = px - cx, dy = py - cy;
+      const rho2 = (dy * dy) / (WAIST_X * WAIST_X) + (dx * dx) / (WAIST_Y * WAIST_Y);
+      if (rho2 <= FLAT_TOP * FLAT_TOP) return 1;
+      const t = (rho2 - FLAT_TOP * FLAT_TOP) / (1 - FLAT_TOP * FLAT_TOP);
+      return Math.exp(-2 * t);
+    }
+
+    /* --------------------------------------------------------------------
+       MAIN ANIMATION LOOP
+    -------------------------------------------------------------------- */
+    let lastTime = performance.now();
+    (function loop() {
+      const now = performance.now();
+      const dt  = (now - lastTime) / 1000;
+      lastTime  = now;
+
+      /* ---------------- Update diffusing particles ------------------- */
+      particles.forEach(p => {
+        p.vx += (Math.random() * 2 - 1) * 0.44 * dpr;
+        p.vy += (Math.random() * 2 - 1) * 0.44 * dpr;
+        const speed = Math.hypot(p.vx, p.vy);
+        if (speed > 4 * dpr) {
+          p.vx *= (4 * dpr) / speed;
+          p.vy *= (4 * dpr) / speed;
+        }
+        p.x += p.vx;
+        p.y += p.vy;
+        // wrap around
+        const w = simCanvas.width, h = simCanvas.height, r = p.r;
+        if (p.x < -r) p.x += w + 2 * r;
+        else if (p.x > w + r) p.x -= w + 2 * r;
+        if (p.y < -r) p.y += h + 2 * r;
+        else if (p.y > h + r) p.y -= h + 2 * r;
+
+        // conformational switching
+        p.tSwitch -= dt;
+        if (p.tSwitch <= 0) {
+          if (p.shape === 'circle') {
+            p.shape = 'square';
+            p.tSwitch = expRand(RATE_SQR2CIRCLE);
+          } else {
+            p.shape = 'circle';
+            p.tSwitch = expRand(RATE_CIRCLE2SQR);
+          }
+        }
+      });
+
+      /* ------------------- Update mouse particle --------------------- */
+      if (mouseAsParticle && mouseParticle) {
+        mouseParticle.x = mousePos.x;
+        mouseParticle.y = mousePos.y;
+        mouseParticle.tSwitch -= dt;
+        if (mouseParticle.tSwitch <= 0) {
+          if (mouseParticle.shape === 'circle') {
+            mouseParticle.shape = 'square';
+            mouseParticle.tSwitch = expRand(RATE_SQR2CIRCLE);
+          } else {
+            mouseParticle.shape = 'circle';
+            mouseParticle.tSwitch = expRand(RATE_CIRCLE2SQR);
+          }
+        }
+      }
+
+      const allParticles = mouseAsParticle && mouseParticle
+        ? particles.concat(mouseParticle)
+        : particles;
+
+      /* ---------------- Compute photon counts ------------------------ */
+      let gCounts = 0, rCounts = 0;
+      allParticles.forEach(p => {
+        const w = confocalWeight(p.x, p.y);
+        const gPeak = (p.shape === 'circle') ? CIRCLE_G : SQUARE_G;
+        const rPeak = (p.shape === 'circle') ? CIRCLE_R : SQUARE_R;
+        gCounts += samplePoisson((BASELINE + w * (gPeak - BASELINE)) * dt);
+        rCounts += samplePoisson((BASELINE + w * (rPeak - BASELINE)) * dt);
+      });
+
+      greenSeries.push([now, gCounts / dt]);
+      redSeries.push([now, rCounts / dt]);
+      while (greenSeries[0] && greenSeries[0][0] < now - HISTORY_MS) {
+        greenSeries.shift();
+        redSeries.shift();
+      }
+
+      /* -------------------- Canvas drawing --------------------------- */
+      // fade previous frame (trail effect)
+      simCtx.globalCompositeOperation = 'destination-out';
+      simCtx.fillStyle = `rgba(0,0,0,${TRAIL_ALPHA})`;
+      simCtx.fillRect(0, 0, simCanvas.width, simCanvas.height);
+      simCtx.globalCompositeOperation = 'source-over';
+
+      // confocal volume visualisation
+      simCtx.save();
+      simCtx.translate(simCanvas.width / 2, simCanvas.height / 2);
+      simCtx.rotate(Math.PI / 2);
+      simCtx.scale(WAIST_X / WAIST_Y, 1);
+      const grad = simCtx.createRadialGradient(0, 0, FLAT_TOP * WAIST_Y, 0, 0, WAIST_Y);
+      grad.addColorStop(0, 'rgba(0,150,255,0.25)');
+      grad.addColorStop(0.001, 'rgba(0,150,255,0.25)');
+      grad.addColorStop(1, 'rgba(0,150,255,0)');
+      simCtx.fillStyle = grad;
+      simCtx.beginPath();
+      simCtx.arc(0, 0, WAIST_Y, 0, Math.PI * 2);
+      simCtx.fill();
+      simCtx.restore();
+
+      // draw particles (diffusing + optional mouse)
+      simCtx.globalAlpha = 0.7;
+      allParticles.forEach(p => {
+        if (p.shape === 'circle') {
+          simCtx.fillStyle   = '#d62728';
+          simCtx.strokeStyle = '#000';
+          simCtx.lineWidth   = 2 * dpr;
+          simCtx.beginPath();
+          simCtx.arc(p.x, p.y, p.r, 0, Math.PI * 2);
+          simCtx.fill();
+          simCtx.stroke();
+        } else {
+          simCtx.fillStyle   = '#1f77b4';
+          simCtx.strokeStyle = '#000';
+          simCtx.lineWidth   = 2 * dpr;
+          simCtx.fillRect(p.x - p.r, p.y - p.r, p.r * 2, p.r * 2);
+          simCtx.strokeRect(p.x - p.r, p.y - p.r, p.r * 2, p.r * 2);
+        }
+      });
+      simCtx.globalAlpha = 1;
+
+      /* ------------------- Time-series plotting ---------------------- */
+      plotCtx.clearRect(0, 0, plotCanvas.width, plotCanvas.height);
+
+      // baseline
+      plotCtx.strokeStyle = '#444';
+      plotCtx.lineWidth = 1;
+      plotCtx.beginPath();
+      plotCtx.moveTo(0, plotHeightPx - 1);
+      plotCtx.lineTo(plotCanvas.width, plotHeightPx - 1);
+      plotCtx.stroke();
+
+      function drawSeries(series, colour) {
+        if (series.length < 2) return;
+        const start = now - HISTORY_MS;
+        plotCtx.strokeStyle = colour;
+        plotCtx.lineWidth = 2 * dpr;
+        plotCtx.beginPath();
+        series.forEach(([t, rate], i) => {
+          const x = ((t - start) / HISTORY_MS) * plotCanvas.width;
+          const y = plotHeightPx - (rate / MAX_RATE_CH) * plotHeightPx;
+          i === 0 ? plotCtx.moveTo(x, y) : plotCtx.lineTo(x, y);
+        });
+        plotCtx.stroke();
+      }
+      drawSeries(greenSeries, '#00cc00');
+      drawSeries(redSeries,   '#ff7700');
+
+      requestAnimationFrame(loop);
+    })();
+
+    /* ---------------------------- Controls ---------------------------- */
+    applyBtn.addEventListener('click', () => {
+      let np  = parseInt(numParticlesInput.value, 10);
+      let c2s = parseFloat(rateC2SInput.value);
+      let s2c = parseFloat(rateS2CInput.value);
+
+      if (!isNaN(np))  NUM_PARTICLES   = Math.max(1, np);
+      if (!isNaN(c2s)) RATE_CIRCLE2SQR = Math.max(0.1, c2s);
+      if (!isNaN(s2c)) RATE_SQR2CIRCLE = Math.max(0.1, s2c);
+
+      // update max photon rate estimate
+      MAX_RATE_CH = Math.max(CIRCLE_R, SQUARE_G) * (NUM_PARTICLES + (mouseAsParticle ? 1 : 0));
+
+      createParticles();
+      if (mouseAsParticle) createMouseParticle();
+
+      // reflect clamped values back to UI
+      numParticlesInput.value = NUM_PARTICLES;
+      rateC2SInput.value      = RATE_CIRCLE2SQR;
+      rateS2CInput.value      = RATE_SQR2CIRCLE;
+    });
+  </script>
+</body>
+</html>
